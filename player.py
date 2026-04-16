@@ -71,13 +71,20 @@ class VideoPlayer:
 
         cmd = [
             MPV_PATH,
-            "--idle=yes",            # fica aberto sem arquivo
-            "--force-window=yes",    # exibe janela mesmo sem vídeo
-            "--fullscreen",          # tela cheia
-            "--ontop",               # manter janela visível
-            "--vo=gpu,d3d11,direct3d", # Ordem de preferência de drivers
-            "--hwdec=auto-safe",     # Aceleração de hardware segura
-            "--msg-level=all=warn",  # Menos logs inúteis
+            "--idle=yes",
+            "--force-window=yes",
+            "--fullscreen",
+            "--ontop",
+            # Forçar D3D11 explicitamente — evita fallback para software rendering
+            "--vo=gpu",
+            "--gpu-api=d3d11",
+            # Decodificação por hardware via D3D11VA (evita decodificação por CPU)
+            "--hwdec=d3d11va",
+            # Sincronizar com o refresh do monitor — evita renderizar frames extras
+            "--video-sync=display-resample",
+            # Limitar FPS ao refresh do monitor (evita loop de render a 200+ FPS)
+            "--display-fps-override=60",
+            "--msg-level=all=warn",
             "--no-input-default-bindings",
             f"--input-ipc-server={self._pipe_path}",
             "--log-file=mpv.log",
@@ -424,7 +431,7 @@ class VideoPlayer:
                 break
 
             if bytes_avail.value == 0:
-                time.sleep(0.01)  # nenhum dado — aguarda 10ms e tenta novamente
+                time.sleep(0.033)  # ~30x/s — suficiente para detectar eventos do mpv
                 continue
 
             # Há dados: lê sem risco de bloquear (ReadFile direto, sem lock MSVCRT)

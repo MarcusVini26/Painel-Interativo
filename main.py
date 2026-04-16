@@ -286,15 +286,16 @@ class PainelController:
             try:
                 if self.detector.process_frame(frame):
                     logger.info("[Câmera] ★★★ ACENO DETECTADO! ★★★")
-                    # Ativar cooldown imediatamente para evitar re-disparo
                     self._cooldown_until = time.time() + COOLDOWN_SECONDS
                     self._wave_detected.set()
                     self.detector.reset()
-                    # O player será substituído pelo play_presentation do loop principal.
-                    # Evitamos um stop() extra para não criar condições de corrida no mpv.
 
             except Exception as exc:
                 logger.error(f"[Câmera] Erro durante detecção: {exc}")
+
+            # Pausa para não saturar o CPU — MediaPipe é pesado e 15fps
+            # é suficiente para detectar acenos com precisão.
+            time.sleep(0.066)  # ~15 fps
 
         # --- Encerrar câmera ao sair ---
         if cap and cap.isOpened():
