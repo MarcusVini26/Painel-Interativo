@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+*.log
+
+# Ambiente virtual
+venv/
+.venv/
+env/
+
+# VS Code
+.vscode/
+
+# Cache MediaPipe / TensorFlow
+*.tflite
