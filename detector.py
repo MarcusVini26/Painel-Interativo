@@ -1,8 +1,9 @@
-# ============================================================
-# detector.py — Detecção do gesto de aceno com MediaPipe Hands
+﻿# ============================================================
+# detector.py - Deteccao do gesto de aceno com MediaPipe Hands
 # ============================================================
 
 import logging
+import math
 import time
 from collections import deque
 
@@ -10,6 +11,7 @@ import cv2
 import mediapipe as mp
 
 from config import (
+    MAX_NUM_HANDS,
     MIN_HAND_SIZE,
     WAVE_ALTERNATIONS,
     WAVE_MIN_MOVEMENT,
@@ -21,73 +23,134 @@ logger = logging.getLogger(__name__)
 
 class WaveDetector:
     """
-    Detecta o gesto de aceno horizontal a partir de frames BGR.
+    Detecta aceno horizontal em paralelo para varias maos.
 
-    Usa uma máquina de estados incremental: cada alternância é contada
-    no exato frame em que acontece, sem reprocessar o histórico inteiro.
-    Isso garante detecção correta tanto para acenos lentos quanto rápidos.
+    Regra atual: dispara quando a primeira mao completar um aceno valido,
+    independentemente de proximidade.
     """
 
-    # Tempo máximo sem mão antes de zerar o estado (segundos).
-    # Evita reset por frames isolados de perda de tracking em movimentos rápidos.
-    _NO_HAND_GRACE = 0.20
+    # Track e considerado perdido apos esse tempo sem match.
+    _NO_HAND_GRACE = 0.45
+    # Distancia maxima entre punhos normalizados para associar ao mesmo track.
+    _TRACK_MATCH_MAX_DIST = 0.40
 
     def __init__(self):
         self._mp_hands = mp.solutions.hands
         self._hands = self._mp_hands.Hands(
             static_image_mode=False,
-            max_num_hands=1,
+            max_num_hands=MAX_NUM_HANDS,
             min_detection_confidence=0.6,
-            min_tracking_confidence=0.3,  # mais tolerante em movimentos rápidos
+            min_tracking_confidence=0.3,
         )
-        # Histórico para o debug_camera (visualização do gráfico)
+
+        # Historico para debug do movimento horizontal da mao lider.
         self._wrist_history = deque()
 
-        # Estado incremental da detecção
-        self._last_extreme   = None
-        self._last_direction = None
-        self._alternations   = 0
-        self._last_hand_seen = 0.0    # timestamp da última mão detectada
+        # Estado exposto para debug_camera.
+        self._alternations = 0
+        self._last_hand_seen = 0.0
+        self._active_wrist = None
+        self._active_score = 0.0
+        self._candidate_count = 0
+        self._last_selection_reason = "none"
+
+        # Tracks de maos em paralelo.
+        self._tracks = {}
+        self._next_track_id = 1
+
+        # Rate limit de logs por evento.
+        self._last_event_log = {}
 
     # ------------------------------------------------------------------
-    # Interface pública
+    # Interface publica
     # ------------------------------------------------------------------
 
     def process_frame(self, frame):
-        """
-        Analisa um frame e retorna True se o gesto de aceno for detectado.
-        """
-        self._purge_old_history()
+        """Analisa um frame e retorna True quando detectar aceno."""
+        now = time.time()
+        self._purge_old_history(now)
 
-        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._hands.process(rgb)
 
-        if not results.multi_hand_landmarks:
-            # Grace period: só reseta após mão ausente por _NO_HAND_GRACE segundos.
-            # Evita zerar alternâncias por 1-2 frames de tracking perdido
-            # durante movimentos rápidos ou amplos.
-            if time.time() - self._last_hand_seen > self._NO_HAND_GRACE:
-                self._reset_wave_state()
+        candidates = self._extract_candidates(results)
+        self._candidate_count = len(candidates)
+
+        matches = self._match_candidates_to_tracks(candidates, now)
+        self._cleanup_stale_tracks(now)
+
+        if not matches:
+            self._active_wrist = None
+            self._active_score = 0.0
+            self._alternations = 0
+            self._last_selection_reason = "none"
             return False
 
-        hand_landmarks   = results.multi_hand_landmarks[0]
-        xs               = [lm.x for lm in hand_landmarks.landmark]
-        hand_width_ratio = max(xs) - min(xs)
+        self._last_hand_seen = now
 
-        if hand_width_ratio < MIN_HAND_SIZE:
-            return False
+        detections = []
+        leader = None
 
-        self._last_hand_seen = time.time()
-        wrist_x = hand_landmarks.landmark[0].x
-        self._wrist_history.append((self._last_hand_seen, wrist_x))
+        for track, cand in matches:
+            if self._update_track_state(track, cand["wrist_x"], now):
+                detections.append((track, cand))
 
-        return self._update_state(wrist_x)
+            if leader is None:
+                leader = (track, cand)
+            else:
+                l_track, l_cand = leader
+                # Lider de acompanhamento para debug:
+                # prioriza quem esta mais avancado no aceno e,
+                # em empate, quem iniciou antes (sem vies por proximidade).
+                if (
+                    track["alternations"] > l_track["alternations"]
+                    or (
+                        track["alternations"] == l_track["alternations"]
+                        and (
+                            track["started_at"] < l_track["started_at"]
+                            or (
+                                track["started_at"] == l_track["started_at"]
+                                and track["id"] < l_track["id"]
+                            )
+                        )
+                    )
+                ):
+                    leader = (track, cand)
+
+        if detections:
+            winner_track, winner_cand = self._pick_detection_winner(detections)
+            self._active_wrist = (winner_cand["wrist_x"], winner_cand["wrist_y"])
+            self._active_score = winner_cand["score"]
+            self._alternations = winner_track["alternations"]
+            self._wrist_history.append((now, winner_cand["wrist_x"]))
+            self._last_selection_reason = "wave_first_valid"
+            self._log_event(
+                "WAVE_DETECTED",
+                (
+                    "WAVE_DETECTED: track=%s alternancias=%s score=%.3f"
+                    % (winner_track["id"], winner_track["alternations"], winner_cand["score"])
+                ),
+            )
+            return True
+
+        leader_track, leader_cand = leader
+        self._active_wrist = (leader_cand["wrist_x"], leader_cand["wrist_y"])
+        self._active_score = leader_cand["score"]
+        self._alternations = leader_track["alternations"]
+        self._wrist_history.append((now, leader_cand["wrist_x"]))
+        self._last_selection_reason = "tracking"
+        return False
 
     def reset(self):
-        """Limpa histórico e estado. Chamar após detecção ou ao sair do cooldown."""
+        """Limpa historico e estado interno."""
         self._wrist_history.clear()
-        self._reset_wave_state()
+        self._alternations = 0
         self._last_hand_seen = 0.0
+        self._active_wrist = None
+        self._active_score = 0.0
+        self._candidate_count = 0
+        self._last_selection_reason = "reset"
+        self._tracks.clear()
         logger.debug("Detector resetado")
 
     def release(self):
@@ -96,58 +159,149 @@ class WaveDetector:
         logger.debug("Recursos do MediaPipe liberados")
 
     # ------------------------------------------------------------------
-    # Internos
+    # Internos: candidatos e tracking
     # ------------------------------------------------------------------
 
-    def _reset_wave_state(self):
-        """Zera a máquina de estados sem tocar no histórico."""
-        self._last_extreme   = None
-        self._last_direction = None
-        self._alternations   = 0
+    def _extract_candidates(self, results):
+        candidates = []
+        if not results.multi_hand_landmarks:
+            return candidates
 
-    def _update_state(self, wrist_x):
-        """
-        Atualiza a máquina de estados com a nova posição do pulso.
+        for hand_landmarks in results.multi_hand_landmarks:
+            xs = [lm.x for lm in hand_landmarks.landmark]
+            size_ratio = max(xs) - min(xs)
+            if size_ratio < MIN_HAND_SIZE:
+                continue
 
-        Conta alternâncias incrementalmente — não reprocessa o histórico.
-        Retorna True quando WAVE_ALTERNATIONS é atingido.
-        """
-        if self._last_extreme is None:
-            self._last_extreme = wrist_x
+            wrist = hand_landmarks.landmark[0]
+            candidates.append(
+                {
+                    "wrist_x": wrist.x,
+                    "wrist_y": wrist.y,
+                    "score": size_ratio,
+                }
+            )
+
+        return candidates
+
+    def _match_candidates_to_tracks(self, candidates, now):
+        # Somente tracks recentes participam do matching.
+        viable_track_ids = [
+            tid for tid, tr in self._tracks.items() if now - tr["last_seen"] <= self._NO_HAND_GRACE
+        ]
+        unused_tracks = set(viable_track_ids)
+        unmatched_candidates = list(candidates)
+        matches = []
+
+        # Association global por menor distancia para reduzir troca de identidade
+        # quando existem duas ou mais maos simultaneas.
+        pair_distances = []
+        for tid in viable_track_ids:
+            tr = self._tracks[tid]
+            for cand in candidates:
+                dx = cand["wrist_x"] - tr["wrist_x"]
+                dy = cand["wrist_y"] - tr["wrist_y"]
+                dist = math.hypot(dx, dy)
+                if dist <= self._TRACK_MATCH_MAX_DIST:
+                    pair_distances.append((dist, tid, cand))
+
+        pair_distances.sort(key=lambda item: item[0])
+
+        matched_candidate_ids = set()
+        for _, tid, cand in pair_distances:
+            cand_id = id(cand)
+            if tid not in unused_tracks or cand_id in matched_candidate_ids:
+                continue
+
+            unused_tracks.remove(tid)
+            matched_candidate_ids.add(cand_id)
+            tr = self._tracks[tid]
+            tr["wrist_x"] = cand["wrist_x"]
+            tr["wrist_y"] = cand["wrist_y"]
+            tr["score"] = cand["score"]
+            tr["last_seen"] = now
+            matches.append((tr, cand))
+
+        unmatched_candidates = [cand for cand in candidates if id(cand) not in matched_candidate_ids]
+        for cand in unmatched_candidates:
+            tr = self._create_track(cand, now)
+            matches.append((tr, cand))
+            self._log_event("TRACK_CREATED", f"TRACK_CREATED: id={tr['id']}")
+
+        return matches
+
+    def _create_track(self, cand, now):
+        tid = self._next_track_id
+        self._next_track_id += 1
+
+        track = {
+            "id": tid,
+            "wrist_x": cand["wrist_x"],
+            "wrist_y": cand["wrist_y"],
+            "score": cand["score"],
+            "last_seen": now,
+            "last_extreme": None,
+            "last_direction": None,
+            "alternations": 0,
+            "started_at": now,
+            "completed_at": None,
+        }
+        self._tracks[tid] = track
+        return track
+
+    def _cleanup_stale_tracks(self, now):
+        stale = [tid for tid, tr in self._tracks.items() if now - tr["last_seen"] > self._NO_HAND_GRACE]
+        for tid in stale:
+            self._tracks.pop(tid, None)
+            self._log_event("TRACK_LOST", f"TRACK_LOST: id={tid}")
+
+    # ------------------------------------------------------------------
+    # Internos: maquina de aceno por track
+    # ------------------------------------------------------------------
+
+    def _update_track_state(self, track, wrist_x, now):
+        if track["last_extreme"] is None:
+            track["last_extreme"] = wrist_x
             return False
 
-        delta = wrist_x - self._last_extreme
-
+        delta = wrist_x - track["last_extreme"]
         if abs(delta) < WAVE_MIN_MOVEMENT:
             return False
 
         direction = "r" if delta > 0 else "l"
 
-        if self._last_direction is not None and direction != self._last_direction:
-            self._alternations += 1
+        if track["last_direction"] is not None and direction != track["last_direction"]:
+            track["alternations"] += 1
 
-        self._last_direction = direction
-        self._last_extreme   = wrist_x
+        track["last_direction"] = direction
+        track["last_extreme"] = wrist_x
 
-        if self._alternations >= WAVE_ALTERNATIONS:
-            logger.info(
-                f"Aceno detectado! Alternâncias={self._alternations} "
-                f"(mín={WAVE_ALTERNATIONS})"
-            )
-            self._wrist_history.clear()
-            self._reset_wave_state()
+        if track["alternations"] >= WAVE_ALTERNATIONS:
+            track["completed_at"] = now
             return True
 
         return False
 
-    def _purge_old_history(self):
-        """
-        Remove entradas antigas do histórico. Se a janela expirar completamente
-        (sem mão por WAVE_WINDOW_SECONDS), zera também o estado incremental.
-        """
-        cutoff = time.time() - WAVE_WINDOW_SECONDS
+    @staticmethod
+    def _pick_detection_winner(detections):
+        # Se mais de uma completar no mesmo frame, escolhe a que iniciou antes.
+        return min(
+            detections,
+            key=lambda item: (
+                item[0]["completed_at"] or 0.0,
+                item[0]["started_at"],
+                item[0]["id"],
+            ),
+        )
+
+    def _log_event(self, event_name, message):
+        now = time.time()
+        last = self._last_event_log.get(event_name, 0.0)
+        if now - last >= 1.0:
+            logger.info(message)
+            self._last_event_log[event_name] = now
+
+    def _purge_old_history(self, now):
+        cutoff = now - WAVE_WINDOW_SECONDS
         while self._wrist_history and self._wrist_history[0][0] < cutoff:
             self._wrist_history.popleft()
-
-        if not self._wrist_history:
-            self._reset_wave_state()

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh repo:*)",
+      "Bash(gh pr create --title 'Correções de bugs, performance e detecção de gestos' --body ':*)"
+    ]
+  }
+}
