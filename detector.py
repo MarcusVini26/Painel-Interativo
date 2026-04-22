@@ -40,7 +40,7 @@ class WaveDetector:
             static_image_mode=False,
             max_num_hands=MAX_NUM_HANDS,
             min_detection_confidence=0.6,
-            min_tracking_confidence=0.3,
+            min_tracking_confidence=0.5,
         )
 
         # Historico para debug do movimento horizontal da mao lider.
@@ -70,7 +70,8 @@ class WaveDetector:
         now = time.time()
         self._purge_old_history(now)
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        small = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         results = self._hands.process(rgb)
 
         candidates = self._extract_candidates(results)

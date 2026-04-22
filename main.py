@@ -295,7 +295,7 @@ class PainelController:
 
             # Pausa para não saturar o CPU — MediaPipe é pesado e 15fps
             # é suficiente para detectar acenos com precisão.
-            time.sleep(0.066)  # ~15 fps
+            time.sleep(0.1)  # ~10 fps — suficiente para detectar acenos
 
         # --- Encerrar câmera ao sair ---
         if cap and cap.isOpened():
