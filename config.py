@@ -19,9 +19,15 @@ MAX_NUM_HANDS = 4         # Quantidade maxima de maos analisadas por frame
 COOLDOWN_SECONDS = 0.03    # Tempo de espera apos disparar o video (segundos)
 
 import os
+import shutil
+import sys
 
 # --- Caminhos de Video ---
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # Quando empacotado em .exe (PyInstaller), usar a pasta do executavel.
+    ROOT_DIR = os.path.dirname(sys.executable)
+else:
+    ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Garantir que os nomes das pastas correspondam ao sistema de arquivos
 LOOP_FOLDER = os.path.join(ROOT_DIR, "Videos", "loop")
@@ -33,4 +39,9 @@ OVERLAY_FONT_SCALE = 1.0  # Escala da fonte OSD no mpv
 OVERLAY_ALPHA = 0.6       # Transparencia do fundo do texto (reservado)
 
 # --- MPV (Player de Video) ---
-MPV_PATH = r"C:\mpv\mpv.exe"  # Certifique-se que o mpv.exe esta nesta pasta exata
+# Prioridade:
+# 1) C:\mpv\mpv.exe (compatibilidade com ambiente atual)
+# 2) mpv no PATH do Windows (cenario de feira com mpv ja instalado)
+MPV_PATH = r"C:\mpv\mpv.exe"
+if not os.path.exists(MPV_PATH):
+    MPV_PATH = shutil.which("mpv") or MPV_PATH
