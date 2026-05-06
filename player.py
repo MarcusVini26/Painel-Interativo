@@ -52,6 +52,12 @@ class VideoPlayer:
         # Impede que eventos end-file dos vídeos em loop acionem _playback_finished.
         self._awaiting_presentation = False
 
+        # Suporte a get_property_sync — consulta síncrona de propriedades via IPC
+        self._prop_lock = threading.Lock()   # serializa queries; um por vez
+        self._prop_event = threading.Event() # sinaliza chegada da resposta
+        self._prop_result = None             # valor recebido do mpv
+        self._prop_req_id = 0                # id único por query, incrementado no envio
+
     # ------------------------------------------------------------------
     # Ciclo de vida do processo
     # ------------------------------------------------------------------
@@ -137,7 +143,7 @@ class VideoPlayer:
     # Controle de reprodução
     # ------------------------------------------------------------------
 
-    def play_loop(self, videos, osd_text=None):
+    def play_loop(self, videos, osd_text=None, resume_pos=None):
         """
         Carrega uma lista de vídeos em loop contínuo no mpv já aberto.
 
@@ -179,6 +185,20 @@ class VideoPlayer:
         # Garantir que o player não fique pausado
         if not self._cmd(["set_property", "pause", False]):
             return False
+
+        # Retomar posição anterior se fornecida
+        if resume_pos is not None:
+            playlist_pos, time_pos = int(resume_pos[0]), float(resume_pos[1])
+            if 0 < playlist_pos < len(videos):
+                logger.info(f"[Player] Retomando do vídeo {playlist_pos} em {time_pos:.2f}s")
+                time.sleep(0.3)
+                if self._cmd(["set_property", "playlist-pos", playlist_pos]):
+                    if time_pos > 0.5:
+                        time.sleep(0.3)
+                        self._cmd(["seek", time_pos, "absolute"])
+            elif playlist_pos == 0 and time_pos > 0.5:
+                time.sleep(0.3)
+                self._cmd(["seek", time_pos, "absolute"])
 
         # Exibir ou ocultar o texto OSD
         if osd_text:
@@ -331,6 +351,67 @@ class VideoPlayer:
                 logger.error(f"[Player] Erro ao enviar comando '{command}': {exc}")
                 return False
 
+    def _cmd_with_id(self, command, request_id):
+        """Como _cmd(), mas inclui request_id para correlacionar a resposta do mpv."""
+        if not self._is_alive():
+            return False
+        if self._ipc_fd < 0:
+            self._ensure_ipc()
+            if self._ipc_fd < 0:
+                return False
+        with self._lock:
+            try:
+                payload = (
+                    json.dumps({"command": command, "request_id": request_id}, ensure_ascii=False) + "\n"
+                ).encode("utf-8")
+                os.write(self._ipc_fd, payload)
+                return True
+            except OSError as exc:
+                logger.error("[Player] Erro de comunicação (Pipe cmd_with_id): %s", exc)
+                self._ipc_fd = -1
+                try:
+                    if self._ipc is not None:
+                        self._ipc.close()
+                except Exception:
+                    pass
+                self._ipc = None
+                return False
+            except Exception as exc:
+                logger.error(f"[Player] Erro ao enviar comando com id: {exc}")
+                return False
+
+    def get_property_sync(self, name, timeout=2.0):
+        """Consulta uma propriedade do mpv de forma síncrona via IPC. Retorna o valor ou None."""
+        if not self._is_alive() or self._ipc_fd < 0:
+            return None
+        with self._prop_lock:
+            self._prop_req_id += 1
+            req_id = self._prop_req_id
+            self._prop_result = None
+            self._prop_event.clear()
+        if not self._cmd_with_id(["get_property", name], req_id):
+            return None
+        if not self._prop_event.wait(timeout=timeout):
+            logger.warning(f"[Player] Timeout ao consultar propriedade '{name}'")
+            return None
+        with self._prop_lock:
+            return self._prop_result
+
+    def get_loop_position(self):
+        """
+        Retorna (playlist_pos, time_pos) do loop atual, ou (0, 0.0) em falha.
+        Chamar apenas enquanto o loop está ativo (estado IDLE).
+        """
+        playlist_pos = self.get_property_sync("playlist-pos")
+        time_pos = self.get_property_sync("time-pos")
+        if playlist_pos is None:
+            playlist_pos = 0
+        if time_pos is None:
+            time_pos = 0.0
+        pos = (int(playlist_pos), float(time_pos))
+        logger.debug(f"[Player] Posição do loop capturada: playlist={pos[0]}, time={pos[1]:.2f}s")
+        return pos
+
     def _connect_ipc(self, timeout=5.0):
         """
         Tenta conectar ao named pipe do mpv para enviar comandos JSON.
@@ -451,6 +532,13 @@ class VideoPlayer:
                 try:
                     data = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
+                    continue
+
+                if "request_id" in data:
+                    if data.get("request_id") == self._prop_req_id:
+                        with self._prop_lock:
+                            self._prop_result = data.get("data") if data.get("error") == "success" else None
+                        self._prop_event.set()
                     continue
 
                 if data.get("event") == "end-file" and data.get("reason") == "eof":
