@@ -82,6 +82,9 @@ class PainelController:
         self._cooldown_until = 0.0
         self._camera_thread = None  # threading.Thread ou None
 
+        # Posição do loop no momento da interrupção: (playlist_pos, time_pos) ou None
+        self._loop_resume_pos = None
+
     # ------------------------------------------------------------------
     # Loop principal
     # ------------------------------------------------------------------
@@ -156,14 +159,17 @@ class PainelController:
         logger.info(f"[IDLE] Playlist: {nomes}")
 
         # Uma única instância mpv para todos os vídeos — sem flash entre eles
-        if not self.player.play_loop(videos, osd_text=OVERLAY_TEXT):
+        if not self.player.play_loop(videos, osd_text=OVERLAY_TEXT, resume_pos=self._loop_resume_pos):
             logger.error("[IDLE] Falha ao iniciar o loop de reprodução do mpv")
-            if self.player.ensure_started() and self.player.play_loop(videos, osd_text=OVERLAY_TEXT):
+            if self.player.ensure_started() and self.player.play_loop(videos, osd_text=OVERLAY_TEXT, resume_pos=self._loop_resume_pos):
                 logger.warning("[IDLE] Loop recuperado após reiniciar o mpv")
+                self._loop_resume_pos = None
             else:
                 logger.error("[IDLE] Não foi possível recuperar a reprodução do loop")
                 self._shutdown.set()
                 return
+        else:
+            self._loop_resume_pos = None
 
         # Bloqueia o ciclo idle até um aceno ou encerramento
         while not self._shutdown.is_set() and not self._wave_detected.wait(timeout=0.2):
@@ -200,6 +206,13 @@ class PainelController:
             logger.error("[PRESENTING] Não foi possível iniciar o player mpv. Retornando ao modo IDLE")
             self.state = IDLE
             return
+
+        # Capturar posição do loop antes de trocar para apresentação
+        self._loop_resume_pos = self.player.get_loop_position()
+        logger.info(
+            f"[PRESENTING] Posição do loop salva: "
+            f"vídeo {self._loop_resume_pos[0]}, tempo {self._loop_resume_pos[1]:.2f}s"
+        )
 
         # Limpar detecção de aceno ANTES de iniciar a apresentação,
         # para que nenhum aceno residual dispare uma segunda transição
